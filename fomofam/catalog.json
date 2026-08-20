@@ -7,13 +7,14 @@
   "demo": {
     "title": "fomofam-workflow.sh",
     "language": "bash",
-    "code": "# Verify session (needs FOMO_REFRESH_TOKEN env var)\nnode scripts/fomo.mjs whoami\n\n# Trending + token lookup\nnode scripts/fomo.mjs trending\nnode scripts/fomo.mjs search PEPE\n\n# Buy $10 of a Solana token (signed with FOMO_PRIVATE_KEY)\nnode scripts/fomo.mjs swap buy <mint> 1399811149 10\n\n# Post a public thesis on a token you trade\nnode scripts/fomo.mjs thesis <mint> 1399811149 \"accumulating, liquidity looks real\""
+    "code": "# Verify session + keys (FOMO_REFRESH_TOKEN, FOMO_SOLANA_PRIVATE_KEY, optional FOMO_EVM_PRIVATE_KEY)\nnode scripts/fomo.mjs auth\n\n# Trending + token lookup\nnode scripts/fomo.mjs trending\nnode scripts/fomo.mjs search PEPE\n\n# Buy $10 of a Solana token (signed with FOMO_SOLANA_PRIVATE_KEY)\nnode scripts/fomo.mjs swap buy <mint> 1399811149 10\n\n# Post a public thesis on a token you trade\nnode scripts/fomo.mjs thesis <mint> 1399811149 \"accumulating, liquidity looks real\""
   },
   "setup": [
     "Add `FOMO_REFRESH_TOKEN` env var (fomo.family DevTools -> Application -> Local Storage -> privy:refresh_token)",
-    "Add `FOMO_PRIVATE_KEY` env var (base58 Solana secret key of the FOMO account wallet)",
+    "Add `FOMO_SOLANA_PRIVATE_KEY` — Solana wallet export from fomo.family (base58). Alias: FOMO_PRIVATE_KEY",
+    "Optional: add `FOMO_EVM_PRIVATE_KEY` — EVM wallet export (0x hex) for address matching; EVM EIP-712 swaps still need the FOMO app",
     "Recommended: add `FOMO_PROXY_URL` residential proxy — Cloudflare 403s datacenter IPs",
-    "Run via execute_cli with packages [cycletls@2.0.5, @solana/web3.js@1.98.4, tweetnacl@1.0.3, undici@8.10.0] and filesFromSkill fomofam"
+    "Run via execute_cli with packages [cycletls@2.0.5, @solana/web3.js@1.98.4, tweetnacl@1.0.3, undici@8.10.0, ethers@6.13.5] and filesFromSkill fomofam"
   ],
   "install": {
     "type": "bankr",

@@ -4,8 +4,9 @@
  * Mirrors anondevv69/fomofam (bot/src/fomo/*) flows:
  *   Privy refresh -> bearer JWT -> FOMO private API (Chrome-JA3 / proxy / direct)
  *   /swaps/v2 quote -> fast-fill OR locally-key-signed Solana tx -> broadcast
- * Env: FOMO_REFRESH_TOKEN, FOMO_PRIVATE_KEY, FOMO_PROXY_URL, FOMO_BEARER,
- *      FOMO_API_BASE, FOMO_DISABLE_CYCLETLS
+ * Env: FOMO_REFRESH_TOKEN, FOMO_SOLANA_PRIVATE_KEY (or FOMO_PRIVATE_KEY),
+ *      FOMO_EVM_PRIVATE_KEY, FOMO_PROXY_URL, FOMO_BEARER, FOMO_API_BASE,
+ *      FOMO_DISABLE_CYCLETLS
  */
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, chmodSync,
@@ -370,17 +371,110 @@ async function quoteSwap(address, networkId, side, amountArg) {
   return best;
 }
 
-function loadKeyPair() {
-  const pk = (process.env.FOMO_PRIVATE_KEY || "").trim();
-  if (!pk) throw new Error("FOMO_PRIVATE_KEY not set");
+/** Prefer FOMO_SOLANA_PRIVATE_KEY; FOMO_PRIVATE_KEY kept as alias. */
+function solanaKeyEnv() {
+  return (process.env.FOMO_SOLANA_PRIVATE_KEY || process.env.FOMO_PRIVATE_KEY || "").trim();
+}
+
+function looksLikeEvmHexKey(s) {
+  const t = s.trim();
+  if (/^0x[0-9a-fA-F]{64}$/.test(t)) return true;
+  if (/^[0-9a-fA-F]{64}$/.test(t) && /[a-fA-F]/.test(t) && /0/.test(t)) return true;
+  return false;
+}
+
+function loadSolanaKeyPair() {
+  const pk = solanaKeyEnv();
+  if (!pk) {
+    throw new Error(
+      "FOMO_SOLANA_PRIVATE_KEY not set (alias: FOMO_PRIVATE_KEY). Export the Solana wallet from fomo.family — not the EVM key."
+    );
+  }
+  if (looksLikeEvmHexKey(pk) || pk.startsWith("0x")) {
+    throw new Error(
+      "FOMO_SOLANA_PRIVATE_KEY looks like an EVM hex key (0x…). Put the Solana base58 export in FOMO_SOLANA_PRIVATE_KEY and the EVM export in FOMO_EVM_PRIVATE_KEY."
+    );
+  }
   const bytes = b58decode(pk);
   const secretKey = bytes.length === 64 ? bytes : nacl.sign.keyPair.fromSeed(bytes).secretKey;
+  if (secretKey.length !== 64) throw new Error("Solana secret key must decode to 64 bytes (or 32-byte seed)");
   const kp = nacl.sign.keyPair.fromSecretKey(secretKey);
   return { secretKey, publicKey: kp.publicKey };
 }
 
+/** @deprecated use loadSolanaKeyPair */
+function loadKeyPair() {
+  return loadSolanaKeyPair();
+}
+
+/**
+ * FOMO EVM export is 32-byte secp256k1 hex (with or without 0x).
+ */
+function loadEvmPrivateKeyHex() {
+  const raw = (process.env.FOMO_EVM_PRIVATE_KEY || "").trim();
+  if (!raw) throw new Error("FOMO_EVM_PRIVATE_KEY not set");
+  if (!raw.startsWith("0x") && !/^[0-9a-fA-F]{64}$/.test(raw) && B58.includes(raw[0])) {
+    // likely base58 Solana key put in the wrong slot
+    try {
+      b58decode(raw);
+      throw new Error(
+        "FOMO_EVM_PRIVATE_KEY looks like a Solana base58 key. Put that in FOMO_SOLANA_PRIVATE_KEY; use the EVM 0x… export here."
+      );
+    } catch (e) {
+      if (/Solana base58/.test(e.message)) throw e;
+    }
+  }
+  const hex = raw.startsWith("0x") ? raw.slice(2) : raw;
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error(
+      "FOMO_EVM_PRIVATE_KEY must be a 32-byte hex private key (0x + 64 hex chars). Got invalid format."
+    );
+  }
+  return "0x" + hex.toLowerCase();
+}
+
+function evmAddressFromPrivateKey(privHex) {
+  // Use @noble/secp256k1 if present; else try ethers; else throw with setup hint.
+  const require = createRequire(import.meta.url);
+  try {
+    const { Wallet } = require("ethers");
+    return new Wallet(privHex).address;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const { secp256k1 } = require("@noble/secp256k1");
+    const { keccak_256 } = require("@noble/hashes/sha3");
+    const pub = secp256k1.getPublicKey(privHex.slice(2), false); // uncompressed 65 bytes
+    const hash = keccak_256(pub.slice(1));
+    return "0x" + Buffer.from(hash.slice(-20)).toString("hex");
+  } catch {
+    throw new Error(
+      "FOMO_EVM_PRIVATE_KEY set but cannot derive address — install ethers@6 (or @noble/secp256k1 + @noble/hashes) in execute_cli packages."
+    );
+  }
+}
+
+function loadEvmWalletInfo() {
+  const privateKey = loadEvmPrivateKeyHex();
+  const address = evmAddressFromPrivateKey(privateKey);
+  return { privateKey, address };
+}
+
+function collectWalletHints(balancesRo) {
+  const s = JSON.stringify(balancesRo ?? {});
+  const sol = new Set();
+  const evm = new Set();
+  for (const m of s.matchAll(/"(0x[a-fA-F0-9]{40})"/g)) evm.add(m[1].toLowerCase());
+  for (const m of s.matchAll(/"([1-9A-HJ-NP-Za-km-z]{32,44})"/g)) {
+    const a = m[1];
+    if (!a.startsWith("0x") && a.length >= 32) sol.add(a);
+  }
+  return { solana: [...sol], evm: [...evm] };
+}
+
 async function signAndBroadcast(q, solHint) {
-  const { secretKey, publicKey } = loadKeyPair();
+  const { secretKey, publicKey } = loadSolanaKeyPair();
   const raw = Buffer.from(q.v1Tx, "base64");
   if (!raw.length) throw new Error("Quote had an empty swapTransaction");
   let kind, v0 = null, legacy = null;
@@ -399,7 +493,7 @@ async function signAndBroadcast(q, solHint) {
     else legacy.addSignature(user, Buffer.from(sig));
   } catch (e) {
     throw new Error(
-      `User signature rejected (${e.message}). FOMO_PRIVATE_KEY pubkey ${user.toBase58()} is not a signer of this quote tx` +
+      `User signature rejected (${e.message}). FOMO_SOLANA_PRIVATE_KEY pubkey ${user.toBase58()} is not a signer of this quote tx` +
       (solHint ? ` — FOMO wallet is ${solHint}` : "")
     );
   }
@@ -479,15 +573,25 @@ async function executeSwap(address, networkId, side, amountArg) {
   const q = await quoteSwap(address, networkId, side, amountArg);
   if (!q) throw new Error("FOMO returned no quote");
   if (q.relayType === "EVM") {
-    throw new Error("EVM quote — FOMO needs an EIP-712 Privy signature only the app iframe can produce. Headless swaps are Solana-only.");
+    let evmHint = "";
+    try {
+      const w = loadEvmWalletInfo();
+      evmHint = ` FOMO_EVM_PRIVATE_KEY is set (${w.address}), but FOMO's EVM path still needs an EIP-712 typed-data payload from the app (not just a raw private key).`;
+    } catch {
+      evmHint =
+        " Set FOMO_EVM_PRIVATE_KEY from the FOMO EVM wallet export for address matching; headless EVM EIP-712 authorize is not supported yet.";
+    }
+    throw new Error(
+      "EVM quote — FOMO needs an EIP-712 signature the app iframe normally produces." + evmHint +
+        " Prefer Solana-routed quotes (SOL-USDC in) which sign with FOMO_SOLANA_PRIVATE_KEY."
+    );
   }
   let solHint = "";
   try {
     const uid = await currentUserId();
     const bal = await fomoFetch(`/v2/users/${encodeURIComponent(uid)}/balances`);
-    const s = JSON.stringify(bal);
-    const m = s.match(/"([1-9A-HJ-NP-Za-km-z]{32,44})"/);
-    if (m) solHint = m[1];
+    const hints = collectWalletHints(bal);
+    solHint = hints.solana[0] || "";
   } catch { /* optional hint */ }
 
   if (q.relaySwapId) {
@@ -504,7 +608,7 @@ async function executeSwap(address, networkId, side, amountArg) {
       }
     } catch (e) {
       if (!q.v1Tx) throw new Error(`fast-fill failed: ${e.message}`);
-      console.error("[fomo] fast-fill failed:", e.message, "— trying key-sign path");
+      console.error("[fomo] fast-fill failed:", e.message, "— trying Solana key-sign path");
     }
   }
   if (!q.v1Tx) throw new Error("Quote had no relaySwapId and no swapTransaction to sign. Nothing spent.");
@@ -541,10 +645,43 @@ async function main() {
   switch (cmd) {
     case "auth": {
       await ensureBearer();
-      const out = { ok: true, bearerExp: new Date(jwtExpMs(state.bearer) ?? 0).toISOString() };
-      if (process.env.FOMO_PRIVATE_KEY) {
-        try { out.solanaPubkey = new PublicKey(loadKeyPair().publicKey).toBase58(); }
-        catch (e) { out.keyError = e.message; }
+      const out = {
+        ok: true,
+        bearerExp: new Date(jwtExpMs(state.bearer) ?? 0).toISOString(),
+        keys: {
+          solanaEnv: Boolean(solanaKeyEnv()),
+          evmEnv: Boolean((process.env.FOMO_EVM_PRIVATE_KEY || "").trim()),
+        },
+      };
+      let hints = { solana: [], evm: [] };
+      try {
+        const uid = await currentUserId();
+        out.userId = uid;
+        const bal = await fomoFetch(`/v2/users/${encodeURIComponent(uid)}/balances`);
+        hints = collectWalletHints(bal);
+        out.fomoWallets = hints;
+      } catch (e) {
+        out.balancesError = e.message;
+      }
+      if (solanaKeyEnv()) {
+        try {
+          const pk = new PublicKey(loadSolanaKeyPair().publicKey).toBase58();
+          out.solanaPubkey = pk;
+          out.solanaMatchesFomo =
+            hints.solana.length === 0 ? null : hints.solana.includes(pk);
+        } catch (e) {
+          out.solanaKeyError = e.message;
+        }
+      }
+      if ((process.env.FOMO_EVM_PRIVATE_KEY || "").trim()) {
+        try {
+          const w = loadEvmWalletInfo();
+          out.evmAddress = w.address;
+          out.evmMatchesFomo =
+            hints.evm.length === 0 ? null : hints.evm.includes(w.address.toLowerCase());
+        } catch (e) {
+          out.evmKeyError = e.message;
+        }
       }
       printResult(out);
       break;
